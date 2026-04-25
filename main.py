@@ -1,8 +1,11 @@
-"""Sequoia-X-X V2 主程序入口。
+"""Sequoia-X V2 主程序入口。
 
-调度顺序：初始化配置 → 初始化日志 → 数据同步 → 策略执行 → 结果推送。
+两种运行模式：
+  python main.py               # 日常模式：1 次 API 调用补今天 + 跑策略 + 推送（秒级）
+  python main.py --backfill    # 回填模式：16 线程并行拉历史 K 线（首次/补数据用，分钟级）
 """
 
+import argparse
 import sys
 from dotenv import load_dotenv
 load_dotenv()
@@ -26,39 +29,37 @@ from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 
 
 def main() -> None:
-    """
-    主调度函数，按顺序执行完整的数据同步和选股流程。
+    parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="回填模式：单线程保守拉取全市场历史 K 线（自动多轮重跑）",
+    )
+    args = parser.parse_args()
 
-    流程：
-    1. 加载并校验配置（ValidationError 时终止）
-    2. 初始化日志
-    3. 初始化数据引擎并执行全市场增量同步
-    4. 遍历所有策略依次执行选股
-    5. 有选股结果时推送至对应飞书机器人
-
-    Raises:
-        SystemExit: 任意阶段发生未捕获异常时，以退出码 1 终止进程。
-    """
     try:
         # 1. 初始化配置
         settings = get_settings()
 
         # 2. 初始化日志
         logger = get_logger(__name__)
-        logger.info("Sequoia-X-X V2 启动")
+        logger.info("Sequoia-X V2 启动")
 
-        # 3. 数据同步
+        # 3. 初始化数据引擎
         engine = DataEngine(settings)
-        if date.today().weekday() < 5:  # 周一到周五：0, 1, 2, 3, 4
-            logger.info("工作日，开始增量同步最新数据...")
+
+        if args.backfill:
+            # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
+            logger.info("进入回填模式...")
             all_symbols = engine.get_all_symbols()
-            summary = engine.sync_all(all_symbols)
-            logger.info(
-                f"数据同步完成 — 成功: {summary.success} | "
-                f"跳过: {summary.skipped} | 失败: {summary.failed}"
-            )
-        else:
-            logger.info("🌟 今天是周末，A股休市！直接跳过网络拉取，使用本地最新数据极速调试策略！")
+            engine.backfill(all_symbols)
+            logger.info("Sequoia-X V2 回填模式运行完成")
+            return
+
+        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
+        logger.info("开始拉取最新快照...")
+        count = engine.sync_today_bulk()
+        logger.info(f"快照同步完成，写入 {count} 只股票")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [
@@ -98,7 +99,7 @@ def main() -> None:
             traceback.print_exc()
         sys.exit(1)
 
-    logger.info("Sequoia-X-X V2 运行完成")
+    logger.info("Sequoia-X V2 运行完成")
 
 
 if __name__ == "__main__":
