@@ -33,23 +33,62 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    import time
+
     import baostock as bs
-    bs.login()
+
+    def _login() -> None:
+        lg = bs.login()
+        if lg.error_code != "0":
+            raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
+
+    try:
+        _login()
+    except Exception as exc:
+        logger.warning(f"baostock worker 登录失败，跳过本批任务: {exc}")
+        return []
     results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
+    max_retries = 3
+
+    try:
+        for symbol, bs_code, start, end in tasks:
+            for attempt in range(max_retries):
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start,
+                        end_date=end,
+                        frequency="d",
+                        adjustflag="1",  # 后复权
+                    )
+                    if rs.error_code != "0":
+                        raise RuntimeError(rs.error_msg)
+                    while rs.next():
+                        results.append([symbol] + rs.get_row_data())
+                    break
+                except Exception as exc:
+                    if attempt >= max_retries - 1:
+                        logger.warning(f"[{symbol}] 增量拉取失败，已跳过: {exc}")
+                        break
+
+                    wait = 2 ** (attempt + 1)
+                    logger.warning(
+                        f"[{symbol}] 增量拉取第{attempt + 1}次失败: {exc}，"
+                        f"{wait}s 后重连重试"
+                    )
+                    time.sleep(wait)
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    try:
+                        _login()
+                    except Exception as login_exc:
+                        logger.warning(f"[{symbol}] baostock 重连失败: {login_exc}")
+    finally:
+        bs.logout()
     return results
 
 
@@ -125,7 +164,7 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
-        n_workers = min(8, len(tasks))
+        n_workers = min(4, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
         with Pool(n_workers) as pool:
