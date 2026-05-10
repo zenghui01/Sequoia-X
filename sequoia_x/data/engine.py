@@ -41,16 +41,20 @@ def _bs_fetch_batch(tasks: list) -> dict:
     pid = os.getpid()
     total = len(tasks)
 
+    def _progress(message: str) -> None:
+        logger.info(message)
+        print(message, flush=True)
+
     def _login() -> None:
         lg = bs.login()
         if lg.error_code != "0":
             raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
 
-    logger.info(f"baostock worker[{pid}] 启动，任务数 {total}")
+    _progress(f"baostock worker[{pid}] 启动，任务数 {total}")
     try:
         _login()
     except Exception as exc:
-        logger.warning(f"baostock worker[{pid}] 登录失败，跳过本批任务: {exc}")
+        _progress(f"baostock worker[{pid}] 登录失败，跳过本批任务: {exc}")
         return {"pid": pid, "rows": [], "processed": 0, "empty": 0, "failed": total}
 
     results = []
@@ -61,8 +65,10 @@ def _bs_fetch_batch(tasks: list) -> dict:
 
     try:
         for index, (symbol, bs_code, start, end) in enumerate(tasks, start=1):
-            if index == 1 or index % 50 == 0:
-                logger.info(f"baostock worker[{pid}] 进度 {index}/{total}，当前 {symbol}")
+            _progress(
+                f"baostock worker[{pid}] 正在处理 {index}/{total}: "
+                f"{symbol} ({start} -> {end})"
+            )
 
             for attempt in range(max_retries):
                 try:
@@ -88,13 +94,13 @@ def _bs_fetch_batch(tasks: list) -> dict:
                 except Exception as exc:
                     if attempt >= max_retries - 1:
                         failed += 1
-                        logger.warning(
+                        _progress(
                             f"baostock worker[{pid}] [{symbol}] 增量拉取失败，已跳过: {exc}"
                         )
                         break
 
                     wait = 2 ** (attempt + 1)
-                    logger.warning(
+                    _progress(
                         f"baostock worker[{pid}] [{symbol}] "
                         f"增量拉取第{attempt + 1}次失败: {exc}，{wait}s 后重连重试"
                     )
@@ -107,13 +113,13 @@ def _bs_fetch_batch(tasks: list) -> dict:
                     try:
                         _login()
                     except Exception as login_exc:
-                        logger.warning(
+                        _progress(
                             f"baostock worker[{pid}] [{symbol}] 重连失败: {login_exc}"
                         )
     finally:
         bs.logout()
 
-    logger.info(
+    _progress(
         f"baostock worker[{pid}] 完成，成功 {processed}，无数据 {empty}，"
         f"失败 {failed}，返回 {len(results)} 行"
     )
