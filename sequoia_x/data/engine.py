@@ -40,9 +40,9 @@ def _bs_fetch_batch(tasks: list) -> dict:
 
     pid = os.getpid()
     total = len(tasks)
+    progress_interval = max(1, int(os.getenv("SEQUOIA_SYNC_LOG_INTERVAL", "100")))
 
     def _progress(message: str) -> None:
-        logger.info(message)
         print(message, flush=True)
 
     def _login() -> None:
@@ -65,10 +65,11 @@ def _bs_fetch_batch(tasks: list) -> dict:
 
     try:
         for index, (symbol, bs_code, start, end) in enumerate(tasks, start=1):
-            _progress(
-                f"baostock worker[{pid}] 正在处理 {index}/{total}: "
-                f"{symbol} ({start} -> {end})"
-            )
+            if index == 1 or index == total or index % progress_interval == 0:
+                _progress(
+                    f"baostock worker[{pid}] 进度 {index}/{total}，"
+                    f"当前 {symbol} ({start} -> {end})"
+                )
 
             for attempt in range(max_retries):
                 try:
