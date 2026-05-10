@@ -31,27 +31,39 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
+def _bs_fetch_batch(tasks: list) -> dict:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    import os
     import time
 
     import baostock as bs
+
+    pid = os.getpid()
+    total = len(tasks)
 
     def _login() -> None:
         lg = bs.login()
         if lg.error_code != "0":
             raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
 
+    logger.info(f"baostock worker[{pid}] 启动，任务数 {total}")
     try:
         _login()
     except Exception as exc:
-        logger.warning(f"baostock worker 登录失败，跳过本批任务: {exc}")
-        return []
+        logger.warning(f"baostock worker[{pid}] 登录失败，跳过本批任务: {exc}")
+        return {"pid": pid, "rows": [], "processed": 0, "empty": 0, "failed": total}
+
     results = []
     max_retries = 3
+    processed = 0
+    empty = 0
+    failed = 0
 
     try:
-        for symbol, bs_code, start, end in tasks:
+        for index, (symbol, bs_code, start, end) in enumerate(tasks, start=1):
+            if index == 1 or index % 50 == 0:
+                logger.info(f"baostock worker[{pid}] 进度 {index}/{total}，当前 {symbol}")
+
             for attempt in range(max_retries):
                 try:
                     rs = bs.query_history_k_data_plus(
@@ -64,18 +76,27 @@ def _bs_fetch_batch(tasks: list) -> list:
                     )
                     if rs.error_code != "0":
                         raise RuntimeError(rs.error_msg)
+
+                    symbol_rows = 0
                     while rs.next():
                         results.append([symbol] + rs.get_row_data())
+                        symbol_rows += 1
+                    if symbol_rows == 0:
+                        empty += 1
+                    processed += 1
                     break
                 except Exception as exc:
                     if attempt >= max_retries - 1:
-                        logger.warning(f"[{symbol}] 增量拉取失败，已跳过: {exc}")
+                        failed += 1
+                        logger.warning(
+                            f"baostock worker[{pid}] [{symbol}] 增量拉取失败，已跳过: {exc}"
+                        )
                         break
 
                     wait = 2 ** (attempt + 1)
                     logger.warning(
-                        f"[{symbol}] 增量拉取第{attempt + 1}次失败: {exc}，"
-                        f"{wait}s 后重连重试"
+                        f"baostock worker[{pid}] [{symbol}] "
+                        f"增量拉取第{attempt + 1}次失败: {exc}，{wait}s 后重连重试"
                     )
                     time.sleep(wait)
                     try:
@@ -86,10 +107,23 @@ def _bs_fetch_batch(tasks: list) -> list:
                     try:
                         _login()
                     except Exception as login_exc:
-                        logger.warning(f"[{symbol}] baostock 重连失败: {login_exc}")
+                        logger.warning(
+                            f"baostock worker[{pid}] [{symbol}] 重连失败: {login_exc}"
+                        )
     finally:
         bs.logout()
-    return results
+
+    logger.info(
+        f"baostock worker[{pid}] 完成，成功 {processed}，无数据 {empty}，"
+        f"失败 {failed}，返回 {len(results)} 行"
+    )
+    return {
+        "pid": pid,
+        "rows": results,
+        "processed": processed,
+        "empty": empty,
+        "failed": failed,
+    }
 
 
 class DataEngine:
@@ -166,13 +200,34 @@ class DataEngine:
 
         n_workers = min(4, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        logger.info(
+            f"baostock 并发数 {n_workers}，每批任务数："
+            f"{', '.join(str(len(chunk)) for chunk in chunks)}"
+        )
 
         with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
+            batch_results = pool.imap_unordered(_bs_fetch_batch, chunks)
 
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
+            all_rows = []
+            total_processed = 0
+            total_empty = 0
+            total_failed = 0
+            for batch in batch_results:
+                rows = batch["rows"]
+                all_rows.extend(rows)
+                total_processed += batch["processed"]
+                total_empty += batch["empty"]
+                total_failed += batch["failed"]
+                logger.info(
+                    f"worker[{batch['pid']}] 返回：成功 {batch['processed']}，"
+                    f"无数据 {batch['empty']}，失败 {batch['failed']}，"
+                    f"累计成功 {total_processed}/{len(tasks)}，累计行数 {len(all_rows)}"
+                )
+
+        if total_failed:
+            logger.warning(f"本次增量同步有 {total_failed} 只股票拉取失败，已跳过")
+        if total_empty:
+            logger.info(f"本次增量同步有 {total_empty} 只股票无新数据")
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
