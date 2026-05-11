@@ -40,10 +40,14 @@ class FeishuNotifier:
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
+        import contextlib
+        import io
+
         import baostock as bs
 
         try:
-            lg = bs.login()
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
             if lg.error_code != "0":
                 logger.warning(f"baostock 登录失败，股票名称将使用代码展示: {lg.error_msg}")
                 return {}
@@ -66,7 +70,9 @@ class FeishuNotifier:
                 except Exception as exc:
                     logger.warning(f"[{code}] 股票名称查询异常: {exc}")
         finally:
-            bs.logout()
+            with contextlib.suppress(Exception):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bs.logout()
         return mapping
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:

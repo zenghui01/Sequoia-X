@@ -266,6 +266,9 @@ class DataEngine:
         - 每 200 只股票自动重连 baostock（防止长连接超时）
         - 已入库的自动 skip，中断后可重跑续传
         """
+        import contextlib
+        import io
+        import os
         import time
         from datetime import date, timedelta
 
@@ -274,42 +277,65 @@ class DataEngine:
         today_str = date.today().strftime("%Y-%m-%d")
         max_retries = 3
         reconnect_interval = 200  # 每处理 N 只股票重连一次
+        progress_interval = max(1, int(os.getenv("SEQUOIA_BACKFILL_LOG_INTERVAL", "50")))
 
         def _login():
-            lg = bs.login()
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
             if lg.error_code != "0":
                 logger.error(f"baostock 登录失败: {lg.error_msg}")
                 return False
             return True
 
+        def _logout() -> None:
+            with contextlib.suppress(Exception):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bs.logout()
+
+        total = len(symbols)
+        logger.info(
+            "开始回填历史日线："
+            f"股票数 {total}，目标截止 {today_str}，起始日期 {self.start_date}，"
+            f"每 {progress_interval} 只打印一次进度"
+        )
+
         if not _login():
             return
+        logger.info("baostock 已登录，开始逐只股票回填")
 
         success = 0
         skipped = 0
         failed = 0
         since_reconnect = 0
+        rows_written = 0
 
         try:
             for i, symbol in enumerate(symbols):
+                index = i + 1
                 last_date = self._get_last_date(symbol)
                 if last_date and last_date >= today_str:
                     skipped += 1
-                    if (i + 1) % 500 == 0:
+                    if index == 1 or index == total or index % progress_interval == 0:
                         logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
+                            f"回填进度 {index}/{total} | 当前 {symbol} 已是最新 "
+                            f"(本地最新 {last_date}) | 成功 {success} 跳过 {skipped} "
+                            f"失败 {failed} 写入 {rows_written} 行"
                         )
                     continue
 
                 # 定期重连，防止长连接超时
                 since_reconnect += 1
                 if since_reconnect >= reconnect_interval:
-                    bs.logout()
+                    logger.info(
+                        f"已连续处理 {since_reconnect} 只股票，主动重连 baostock "
+                        "以避免长连接超时"
+                    )
+                    _logout()
                     time.sleep(1)
                     if not _login():
                         logger.error("重连失败，终止回填")
                         return
+                    logger.info("baostock 重连成功，继续回填")
                     since_reconnect = 0
 
                 start = last_date or self.start_date
@@ -317,6 +343,12 @@ class DataEngine:
                     start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
 
                 bs_code = self._to_baostock_code(symbol)
+                if index == 1 or index == total or index % progress_interval == 0:
+                    logger.info(
+                        f"回填进度 {index}/{total} | 当前 {symbol} ({bs_code}) | "
+                        f"拉取区间 {start} -> {today_str} | 成功 {success} "
+                        f"跳过 {skipped} 失败 {failed} 写入 {rows_written} 行"
+                    )
 
                 # 带重试的查询
                 rows = []
@@ -345,15 +377,18 @@ class DataEngine:
                         if attempt < max_retries - 1:
                             wait = 2 ** (attempt + 1)
                             logger.warning(
-                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
+                                f"[{symbol}] 拉取失败 {attempt + 1}/{max_retries}: "
+                                f"{exc}，{wait}s 后重连重试"
                             )
                             time.sleep(wait)
                             # 重连 baostock
-                            bs.logout()
+                            _logout()
                             time.sleep(1)
                             _login()
                         else:
-                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
+                            logger.warning(
+                                f"[{symbol}] 连续 {max_retries} 次拉取失败，已跳过"
+                            )
 
                 if not query_ok:
                     failed += 1
@@ -361,6 +396,11 @@ class DataEngine:
 
                 if not rows:
                     skipped += 1
+                    if index == 1 or index == total or index % progress_interval == 0:
+                        logger.info(
+                            f"回填进度 {index}/{total} | 当前 {symbol} 无新数据 | "
+                            f"成功 {success} 跳过 {skipped} 失败 {failed} 写入 {rows_written} 行"
+                        )
                     continue
 
                 df = pd.DataFrame(rows, columns=rs.fields)
@@ -371,6 +411,9 @@ class DataEngine:
 
                 if df.empty:
                     skipped += 1
+                    logger.info(
+                        f"[{symbol}] 拉到 {len(rows)} 行但清洗后为空，可能是停牌/无成交，已跳过"
+                    )
                     continue
 
                 df["symbol"] = symbol
@@ -387,25 +430,34 @@ class DataEngine:
                     pass
 
                 success += 1
+                rows_written += len(df)
 
-                if (i + 1) % 500 == 0:
+                if index == 1 or index == total or index % progress_interval == 0:
                     logger.info(
-                        f"已处理 {i + 1}/{len(symbols)}，"
-                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
+                        f"回填进度 {index}/{total} | 当前 {symbol} 写入 {len(df)} 行 "
+                        f"({df['date'].min()} -> {df['date'].max()}) | 成功 {success} "
+                        f"跳过 {skipped} 失败 {failed} 累计写入 {rows_written} 行"
                     )
 
         finally:
-            bs.logout()
+            _logout()
 
-        logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
+        logger.info(
+            f"回填完成：共 {total} 只 | 成功 {success} | 跳过 {skipped} | "
+            f"失败 {failed} | 写入 {rows_written} 行"
+        )
 
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
         """通过 baostock 获取全市场 A 股代码列表。"""
+        import contextlib
+        import io
+
         import baostock as bs
 
-        lg = bs.login()
+        with contextlib.redirect_stdout(io.StringIO()):
+            lg = bs.login()
         if lg.error_code != "0":
             logger.error(f"baostock 登录失败: {lg.error_msg}")
             return []
@@ -426,7 +478,9 @@ class DataEngine:
             logger.error(f"获取股票列表失败: {e}")
             return []
         finally:
-            bs.logout()
+            with contextlib.suppress(Exception):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bs.logout()
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:

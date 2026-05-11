@@ -27,13 +27,16 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
         min_size=1, max_size=10, unique=True,
     )
 )
-@h_settings(max_examples=50)
+@h_settings(max_examples=50, deadline=None)
 def test_notification_contains_all_symbols(symbols: list[str]) -> None:
     """属性 10：send() 发出的请求体应包含所有 symbol。"""
     settings = make_settings()
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
+    with (
+        patch.object(FeishuNotifier, "_get_stock_names", return_value={}),
+        patch("requests.post") as mock_post,
+    ):
         mock_post.return_value = MagicMock(status_code=200)
         notifier.send(symbols=symbols, strategy_name="TestStrategy")
 
@@ -48,13 +51,16 @@ def test_notification_contains_all_symbols(symbols: list[str]) -> None:
 @given(
     webhook_url=st.from_regex(r"https://open\.feishu\.cn/open-apis/bot/v2/hook/[a-z0-9\-]{8,36}", fullmatch=True)
 )
-@h_settings(max_examples=50)
+@h_settings(max_examples=50, deadline=None)
 def test_notification_uses_config_url(webhook_url: str) -> None:
     """属性 11：send() 发出的 HTTP 请求目标 URL 应等于 settings.feishu_webhook_url。"""
     settings = make_settings(webhook_url=webhook_url)
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
+    with (
+        patch.object(FeishuNotifier, "_get_stock_names", return_value={}),
+        patch("requests.post") as mock_post,
+    ):
         mock_post.return_value = MagicMock(status_code=200)
         notifier.send(symbols=["000001"], strategy_name="Test", webhook_key="default")
 
@@ -64,7 +70,7 @@ def test_notification_uses_config_url(webhook_url: str) -> None:
 
 # Feature: sequoia-x-v2, Property 12: HTTP 失败时记录 ERROR 日志
 @given(status_code=st.integers(min_value=400, max_value=599))
-@h_settings(max_examples=50)
+@h_settings(max_examples=50, deadline=None)
 def test_http_failure_logs_error(status_code: int) -> None:
     """属性 12：非 200 响应时，send() 应记录 ERROR 级别日志，不抛出异常。"""
     import logging as _logging
@@ -84,7 +90,10 @@ def test_http_failure_logs_error(status_code: int) -> None:
     handler = _ListHandler(_logging.ERROR)
     feishu_logger.addHandler(handler)
     try:
-        with patch("requests.post") as mock_post:
+        with (
+            patch.object(FeishuNotifier, "_get_stock_names", return_value={}),
+            patch("requests.post") as mock_post,
+        ):
             mock_post.return_value = MagicMock(status_code=status_code, text="error")
             notifier.send(symbols=["000001"], strategy_name="Test")
     finally:
