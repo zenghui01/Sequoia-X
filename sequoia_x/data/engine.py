@@ -176,6 +176,7 @@ class DataEngine:
 
     def sync_today_bulk(self) -> int:
         """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        import os
         from datetime import date, timedelta
         from multiprocessing import Pool
 
@@ -205,7 +206,8 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
-        n_workers = min(4, len(tasks))
+        configured_workers = int(os.getenv("SEQUOIA_SYNC_WORKERS", "2"))
+        n_workers = min(max(1, configured_workers), len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
         logger.info(
             f"baostock 并发数 {n_workers}，每批任务数："
